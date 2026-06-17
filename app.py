@@ -43,8 +43,45 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    # Step 1: guard against empty query
+    if not user_query or not user_query.strip():
+        return "Please enter a search query.", "", ""
+
+    # Step 2: select wardrobe
+    wardrobe = (
+        get_example_wardrobe()
+        if wardrobe_choice == "Example wardrobe"
+        else get_empty_wardrobe()
+    )
+
+    # Step 3: run the agent
+    session = run_agent(user_query.strip(), wardrobe)
+
+    # Step 4: early exit on error
+    if session["error"]:
+        return session["error"], "", ""
+
+    # Step 5: format the top listing into a readable panel string
+    item = session["selected_item"]
+    brand = item.get("brand") or "—"
+    style_tags = ", ".join(item.get("style_tags", []))
+    colors = ", ".join(item.get("colors", []))
+
+    listing_text = (
+        f"{item['title']}\n"
+        f"Price: ${item['price']:g}  |  Platform: {item['platform']}\n"
+        f"Size: {item['size']}  |  Condition: {item['condition']}\n"
+        f"Category: {item['category']}  |  Brand: {brand}\n"
+        f"Style: {style_tags}\n"
+        f"Colors: {colors}\n\n"
+        f'"{item["description"]}"'
+    )
+
+    # Prepend any retry notice at the top
+    if session.get("notice"):
+        listing_text = f"⚠️ {session['notice']}\n\n{listing_text}"
+
+    return listing_text, session["outfit_suggestion"], session["fit_card"]
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
