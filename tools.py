@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import time
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -32,6 +33,33 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+# ── LLM helper ────────────────────────────────────────────────────────────────
+
+_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+def call_llm(messages: list[dict], model: str = _MODEL, temperature: float = 0.7) -> str:
+    """
+    Call the Groq chat completion API with up to 3 attempts (exponential backoff).
+    Returns the response content string on success.
+    Raises the last exception after all retries are exhausted.
+    """
+    client = _get_groq_client()
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
+            return response.choices[0].message.content or ""
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)  # 1 s, then 2 s
+    raise last_exc  # type: ignore[misc]
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -136,8 +164,55 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_line = (
+        f"{new_item.get('title', 'item')} "
+        f"({new_item.get('category', '')}; "
+        f"{', '.join(new_item.get('style_tags', []))}; "
+        f"colors: {', '.join(new_item.get('colors', []))})"
+    )
+
+    wardrobe_items = wardrobe.get("items", [])
+
+    if not wardrobe_items:
+        prompt = (
+            f"You are a personal stylist specializing in thrifted fashion.\n\n"
+            f"A user just found this thrifted item: {item_line}\n\n"
+            f"They have not added any wardrobe items yet. "
+            f"Suggest 1-2 complete outfits they could build around this piece using "
+            f"common wardrobe staples. Do not invent or assume specific items they own. "
+            f"Be specific about what styles and types of pieces complement it and why."
+        )
+    else:
+        wardrobe_lines = "\n".join(
+            f"- {w['name']} ({w['category']}; {', '.join(w.get('style_tags', []))}; "
+            f"colors: {', '.join(w.get('colors', []))})"
+            for w in wardrobe_items
+        )
+        prompt = (
+            f"You are a personal stylist specializing in thrifted fashion.\n\n"
+            f"A user just found this thrifted item: {item_line}\n\n"
+            f"Their existing wardrobe includes:\n{wardrobe_lines}\n\n"
+            f"Suggest 1-2 complete outfits that pair the new item with specific named "
+            f"pieces from their wardrobe above. Reference each wardrobe piece by name."
+        )
+
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        result = call_llm(messages, model=_MODEL)
+        if not result.strip():
+            return (
+                "Couldn't generate outfit suggestions right now. "
+                "The item still looks great — try pairing it with basics in similar colors."
+            )
+        return result
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code:
+            return f"Groq error {status_code}"
+        return (
+            "Couldn't generate outfit suggestions right now. "
+            "The item still looks great — try pairing it with basics in similar colors."
+        )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -169,5 +244,33 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return "[fit card unavailable — outfit suggestion was empty]"
+
+    title = new_item.get("title", "this item")
+    price = new_item.get("price", "")
+    platform = new_item.get("platform", "")
+
+    prompt = (
+        f"You are writing a casual, authentic OOTD caption for social media.\n\n"
+        f"The thrifted item is: {title} — ${price} on {platform}\n\n"
+        f"The outfit suggestion is:\n{outfit}\n\n"
+        f"Write a 2–4 sentence caption that:\n"
+        f"- Captures the specific vibe of this outfit\n"
+        f"- Mentions the item name, price (${price}), and platform ({platform}) exactly once each\n"
+        f"- Sounds like a real person posting an OOTD, not a product description\n"
+        f"- Is casual, specific, and energetic\n\n"
+        f"Return only the caption text, nothing else."
+    )
+
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        result = call_llm(messages, model=_MODEL, temperature=0.9)
+        if not result.strip():
+            return "[fit card unavailable — LLM error]"
+        return result
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code:
+            return f"Groq error {status_code}"
+        return "[fit card unavailable — LLM error]"
