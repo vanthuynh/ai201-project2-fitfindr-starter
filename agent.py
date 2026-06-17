@@ -155,11 +155,11 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     session["selected_item"]  = results[0]
 
     # Step 5: suggest outfit
-    # print("Verify State 1", session["selected_item"])
+    print("Verify State 1", session["selected_item"])
     session["outfit_suggestion"] = suggest_outfit(session["selected_item"], wardrobe)
 
     # Step 6: create fit card
-    # print("Verify State 2", session["outfit_suggestion"])
+    print("Verify State 2", session["outfit_suggestion"])
     session["fit_card"] = create_fit_card(
         session["outfit_suggestion"], session["selected_item"]
     )
