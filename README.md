@@ -136,19 +136,48 @@ A single `session` dict (initialized via `_new_session`) serves as the strict si
 | `query` | `object` | Entry point | Parser |
 | `parsed` | `{description, size, max_price}` | Parse step | Search step |
 | `search_results` | `list[dict]` | Search / Retry ladder | Selection step |
-| `notice` | `str | None` *(Added field)* | Retry ladder | UI |
+| `notice` | `str` | None` *(Added field)* | Retry ladder | UI |
 | `selected_item` | `dict` | Selection step | `suggest_outfit` / UI |
 | `wardrobe` | `dict` | Entry point | `suggest_outfit` |
 | `outfit_suggestion` | `str` | `suggest_outfit` | `create_fit_card` / UI |
 | `fit_card` | `str` | `create_fit_card` | UI |
-| `error` | `str | None` | Any early-exit branch | UI *(checked first)* |
+| `error` | `str` | None` | Any early-exit branch | UI *(checked first)* |
 
 ## Error Handling per Tool
 
+1. Trigger search_listings returning zero results. Run this directly from the terminal:
 
+```
+python -c "from tools import search_listings; print(search_listings('designer ballgown', size='XXS', max_price=5))"
+```
+
+Confirm it returns an empty list [] without raising an exception. Then run the full agent with the same impossible query and confirm the agent's response tells the user what failed and what they can try — not just "no results found."
+
+
+2. Trigger suggest_outfit with an empty wardrobe:
+```
+python -c "
+from tools import search_listings, suggest_outfit
+from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+results = search_listings('vintage graphic tee', size=None, max_price=50)
+print(suggest_outfit(results[0], get_empty_wardrobe()))
+"
+```
+Confirm it returns a useful string (general styling advice) rather than raising an exception or returning an empty string.
+
+
+3. Trigger create_fit_card with an empty outfit string:
+```
+python -c "
+from tools import search_listings, create_fit_card
+results = search_listings('vintage graphic tee', size=None, max_price=50)
+print(create_fit_card('', results[0]))
+"
+```
+Confirm it returns a descriptive error message string — not a Python exception.
 
 ## AI Usage
 
-1. Implementing suggest_outfit(): 
+1. Implementing suggest_outfit(): I asked Claude Code to refer to numbered step and description from suggest_outfit() function in tool.py and Tool 2 spec from planning.md. Claude code helped me implemented a working suggest_outfit() and test cases.
 
-2. Implementing run_agent() and the planning loop:
+2. Implementing run_agent() and the planning loop: I asked Claude Code to refer to numbered step in agent.py and Planning as well as State Management from planning.md. Claude code helped me implemented a working run_agent() function that also passed all test cases..
