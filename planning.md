@@ -97,6 +97,7 @@ LLM Failure: Utilizes the identical `call_llm` backoff and graceful error string
 ### Additional Tools (if any)
 
 <!-- Copy the block above for any tools beyond the required three -->
+None during planning
 
 ---
 
@@ -104,6 +105,32 @@ LLM Failure: Utilizes the identical `call_llm` backoff and graceful error string
 
 **How does your agent decide which tool to call next?**
 <!-- Describe the logic your planning loop uses. What does it look at? What conditions change its behavior? How does it know when it's done? -->
+**Overview**
+The loop manages state using a single `session` dictionary and branches conditionally based on tool outputs; it **does not** execute all three tools unconditionally. The pipeline terminates either upon a search failure (early return) or when a selected item is successfully styled and captioned.
+
+**Execution Flow**
+
+1. **Parse Query:** Extracts `{description, size, max_price}`.
+   * **Primary:** Single LLM call returning JSON (`size`/`max_price` can be `null`).
+   * **Fallback:** If the LLM fails or returns invalid JSON, falls back to a regex parser (e.g., extracts `$NN` or `under NN` for price, `size X` for size, and uses the raw query for description).
+   * **Store:** `session["parsed"]`.
+
+2. **Search:** Calls `search_listings(description, size, max_price)` and stores in `session["search_results"]`.
+
+3. **Retry scheme:** If search results are empty, it attempts recovery:
+   * **Drop Price:** Retries with `max_price=None`. If matches are found, populates `session["notice"]` ("Nothing under $X — showing over-budget matches.").
+   * **Drop Price & Size:** If still empty, retries with `max_price=None` and `size=None`. If matches are found, updates the notice ("Nothing in size Y either — showing all sizes.").
+   * **Final Failure:** If still empty, populates `session["error"]` ("No <desc> found, even after dropping size and price. Try different keywords.") and returns early. It strictly skips the styling and fit card steps.
+
+4. **Suggest:** Grabs the top match `results[0]` (highest score, cheapest on ties) and assigns to `session["selected_item"]`.
+
+5. **Finalize fit:**
+   * Calls `suggest_outfit(selected_item, wardrobe)` -> stores in `session["outfit_suggestion"]`.
+   * Calls `create_fit_card(outfit_suggestion, selected_item)` -> stores in `session["fit_card"]`.
+
+6. **Return:** return the final `session` dictionary.
+
+Note that the program ends when search gives errors OR the program was able to create fit card (session['Done'] is True)
 
 ---
 
@@ -112,6 +139,24 @@ LLM Failure: Utilizes the identical `call_llm` backoff and graceful error string
 **How does information from one tool get passed to the next?**
 <!-- Describe how your agent stores and accesses state within a session. What data is tracked? How is it passed between tool calls? -->
 
+**Overview**
+A single `session` dict (initialized via `_new_session`) serves as the strict single source of truth for each run. Every step writes its output directly to this state before the next step reads it. No hardcode or value reentered by users. `session` doesn't persist between user queries.
+
+**State Schema**
+
+| Key | Type | Written By | Read By |
+| :--- | :--- | :--- | :--- |
+| `query` | `object` | Entry point | Parser |
+| `parsed` | `{description, size, max_price}` | Parse step | Search step |
+| `search_results` | `list[dict]` | Search / Retry ladder | Selection step |
+| `notice` | `str | None` *(Added field)* | Retry ladder | UI |
+| `selected_item` | `dict` | Selection step | `suggest_outfit` / UI |
+| `wardrobe` | `dict` | Entry point | `suggest_outfit` |
+| `outfit_suggestion` | `str` | `suggest_outfit` | `create_fit_card` / UI |
+| `fit_card` | `str` | `create_fit_card` | UI |
+| `error` | `str | None` | Any early-exit branch | UI *(checked first)* |
+
+
 ---
 
 ## Error Handling
@@ -119,11 +164,12 @@ LLM Failure: Utilizes the identical `call_llm` backoff and graceful error string
 For each tool, describe the specific failure mode you're handling and what the agent does in response.
 
 | Tool | Failure mode | Agent response |
-|------|-------------|----------------|
-| search_listings | No results match the query | |
-| suggest_outfit | Wardrobe is empty | |
-| create_fit_card | Outfit input is missing or incomplete | |
-
+| :--- | :--- | :--- |
+| `search_listings` | Zero matches returned | Sets error: `"No listings found for '{description}' in size {size} under ${max_price}. Try broader keywords, a different size, or a higher budget."` **Skips Tools 2 & 3.** |
+| `suggest_outfit` | Empty `wardrobe` list | Alters LLM prompt to request general styling advice rather than specific wardrobe pairings. |
+| `suggest_outfit` | LLM exception or `""` returned | Sets fallback string: `"Couldn't generate outfit suggestions right now. The item still looks great — try pairing it with basics in similar colors."` **Proceeds to Tool 3.** |
+| `create_fit_card` | `outfit` input is empty/whitespace | Returns static string: `"[fit card unavailable — outfit suggestion was empty]"`. **Bypasses LLM.** |
+| `create_fit_card` | LLM exception | Returns static string: `"[fit card unavailable — LLM error]"`. Included in the final output as-is. |
 ---
 
 ## Architecture
@@ -136,6 +182,58 @@ For each tool, describe the specific failure mode you're handling and what the a
      ASCII art, a Mermaid diagram (https://mermaid.js.org/syntax/flowchart.html), or an embedded
      sketch are all fine. You'll share this diagram with an AI tool when asking it to implement
      the planning loop and each individual tool. -->
+```
+run_agent(query, wardrobe)
+         │
+         ▼
+┌─────────────────────────────────┐
+│          1. parse_query         │  LLM → JSON  |  regex fallback
+└─────────────────┬───────────────┘  session["parsed"]
+                  │
+                  ▼
+┌─────────────────────────────────┐
+│  2. search_listings(desc,s,p)   │  deterministic — no LLM
+└─────────────────┬───────────────┘  session["search_results"]
+                  │
+                  ▼
+            ┌─────┴─────┐
+            │  results  │
+            │  empty?   │
+            └─────┬─────┘
+          Yes │         │ No
+              │         └──────────────────────────┐
+              ▼                                    │
+┌─────────────────────────────────┐               │
+│        3. Retry scheme          │               │
+│  ① drop price → max_price=None  │               │
+│  ② drop price & size → both=None│               │
+│     sets session["notice"]      │               │
+│  ③ still empty → session["error"]│              │
+└──┬──────────────────────────┬───┘               │
+   │ error                    │ loosened match     │
+   ▼                          ▼                   │
+(early                results = [item, …] ────────┘
+return)                        │
+                               ▼
+              ┌─────────────────────────────────┐
+              │      4. Select top match        │  results[0]
+              └─────────────────┬───────────────┘  session["selected_item"]
+                                │
+                                ▼
+              ┌─────────────────────────────────┐
+              │  5. suggest_outfit(item, w)      │  LLM
+              └─────────────────┬───────────────┘  session["outfit_suggestion"]
+                                │
+                                ▼
+              ┌─────────────────────────────────┐
+              │  6. create_fit_card(outfit, i)  │  LLM, high temp
+              └─────────────────┬───────────────┘  session["fit_card"]
+                                │
+                                ▼
+                         return session
+
+```
+     
 
 ---
 
@@ -152,9 +250,57 @@ For each tool, describe the specific failure mode you're handling and what the a
      search_listings() using load_listings() from the data loader — then test it against 3 queries
      before trusting it" is a plan. -->
 
-**Milestone 3 — Individual tool implementations:**
+### AI Implementation Plan
 
-**Milestone 4 — Planning loop and state management:**
+**Overview**
+**Tool:** Claude Code.
+
+**Strategy:** Implement and verify sequentially, providing specific spec blocks and schemas for Claude Code to refer to for each component
+
+---
+
+#### Milestone 3: Individual Tool Implementations
+
+* **Tool 1: `search_listings`**
+    * **Prompt:** Provide Tool 1 spec. Instruct Claude to implement using `load_listings()` from `utils/data_loader.py`.
+    * **Logic:** Tokenize `description` by whitespace; count case-insensitive token matches across `title + description + style_tags + colors`.
+    * **Verify:**
+        1. `max_price` filter drops items above the price ceiling.
+        2. `size` filter uses case-insensitive substring matching.
+        3. Items with a score of 0 are explicitly excluded.
+        4. Results are sorted descending by score.
+    * **Test Cases:**
+        * `("vintage graphic tee", "M", 30.0)`
+        * `("chunky platform shoes", None, None)`
+        * `("cottagecore dress", "S", 20.0)`
+
+* **Tool 2: `suggest_outfit`**
+    * **Prompt:** Provide Tool 2 spec alongside the `schema` from `data/wardrobe_schema.json`. Instruct Claude to handle two distinct prompt branches (empty vs. populated wardrobe).
+    * **Verify:**
+        1. **Empty Wardrobe:** The LLM prompt completely excludes specific item references.
+        2. **Populated Wardrobe:** The prompt maps existing items by `name`, `category`, `colors`, and `style_tags`.
+        3. Both execution paths guarantee a non-empty string return.
+        4. LLM exceptions are successfully caught and return the designated fallback string.
+
+* **Tool 3: `create_fit_card`**
+    * **Prompt:** Provide Tool 3 spec and caption guidelines (casual tone, required mentions, vibe capture). Set LLM temperature to `0.9`.
+    * **Verify:**
+        1. **Guardrail:** Passing `outfit=""` returns `"[fit card unavailable — outfit suggestion was empty]"` and bypasses the LLM call entirely.
+        2. Output string is strictly 2–4 sentences.
+        3. Caption explicitly contains the item's `title`, `price`, and `platform`.
+        4. High temperature configuration forces varied text outputs across multiple runs with identical inputs.
+
+---
+
+#### Milestone 4: Planning Loop & State Management
+
+* **`run_agent` Integration**
+    * **Prompt:** Provide the Planning Loop, State Management, and Architecture specs, plus all tool signatures. Instruct Claude to implement `run_agent(user_query: str, wardrobe: dict) -> str` within a new `agent.py` file.
+    * **Verify:**
+        1. **State Completeness:** The `session` dictionary contains all 7 required keys post-run.
+        2. **Immutability:** The original `wardrobe` argument remains unmutated throughout the run.
+        3. **Early Exit Guard:** Queries yielding zero matches return the correct error message and strictly skip `suggest_outfit` and `create_fit_card`.
+        4. **Success Output:** A valid query successfully formats the final output string into three distinct sections: listing header, "HOW TO WEAR IT", and "FIT CARD".
 
 ---
 
@@ -164,14 +310,25 @@ Write out what a full user interaction looks like from start to finish — tool 
 
 **Example user query:** "I'm looking for a vintage graphic tee under $30. I mostly wear baggy jeans and chunky sneakers. What's out there and how would I style it?"
 
-**Step 1:**
+**Step 1: Parse**
 <!-- What does the agent do first? Which tool is called? With what input? -->
 
-**Step 2:**
+* **Execution:** `parse_query` extracts `{description: "vintage graphic tee", size: null, max_price: 30.0}` -> stores in `session["parsed"]`.
+* **Fallback:** If the LLM parse fails, a regex fallback extracts `max_price=30.0`, ignores size, and uses the full query text for `description`.
+
+**Step 2: Search**
 <!-- What happens next? What was returned from step 1? What tool is called now? -->
+* **Execution:** `search_listings` queries the dataset. A matching "Y2K butterfly baby tee" ($18) scores highly and ranks at the top. Populates `session["search_results"]` and sets `selected_item = results[0]`.
+* **Fallback:** If no matches are found, the retry ladder drops `max_price`, then `size`. If still empty, it sets `session["error"]` and **halts execution** (Tools 2 & 3 are skipped entirely).
 
-**Step 3:**
+**Step 3: Suggest Outfit**
 <!-- Continue until the full interaction is complete -->
+* **Execution:** `suggest_outfit` maps the user's populated wardrobe to the new item, generating specific advice (e.g., *"Pair it with your baggy straight-leg jeans..."*) -> stores in `session["outfit_suggestion"]`.
+* **Fallback:** If the LLM rate limits (e.g., 429), `call_llm` applies a 3x backoff before returning a graceful, status-coded string.
 
-**Final output to user:**
-<!-- What does the user actually see at the end? -->
+**Step 4: Create Fit Card**
+* **Execution:** Passing the empty-string guard, the high-temperature LLM generates a unique, vibe-focused caption mentioning the item, price ($18), and platform exactly once -> stores in `session["fit_card"]`.
+
+**Final Output (UI Integration)**
+* **Success Path:** `app.py` renders three panels: **(1)** Matched listing data, **(2)** Outfit suggestion, and **(3)** Fit-card caption. Any retry `notice` is surfaced at the top.
+* **Error Path:** On zero results, Panel 1 displays the `error` string; Panels 2 and 3 remain entirely blank.
